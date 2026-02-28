@@ -171,6 +171,141 @@ def choose_card(hand: list[str], state: GameState) -> int:
     # Placeholder: play first card
     return 0
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  helper functions 
+# ══════════════════════════════════════════════════════════════════════════════
+
+NIGIRI = ("Squid Nigiri", "Salmon Nigiri", "Egg Nigiri")
+
+
+def valid_combo(state: GameState, hand: list[str], my_table: list[str]) -> list[str]:
+    """
+    Returns a list of card names worth playing this turn as a single play.
+    Ordered by point value (highest first):
+      Sashimi triple  = 10 pts
+      Squid + Wasabi  =  9 pts
+      Salmon + Wasabi =  6 pts
+      Tempura pair    =  5 pts
+      Egg + Wasabi    =  3 pts
+
+    Also see chopstick_combo() for 2-card plays when Chopsticks are available,
+    and should_grab_chopsticks() for deciding whether to pick them up this turn.
+    """
+    res = []
+
+    # Sashimi triple (10 pts) — need exactly 2 already down
+    if occurances(my_table, "Sashimi") % 3 == 2 and "Sashimi" in hand:
+        res.append("Sashimi")
+
+    # Squid Nigiri on unused Wasabi (9 pts)
+    if state.has_unused_wasabi and "Squid Nigiri" in hand:
+        res.append("Squid Nigiri")
+
+    # Salmon Nigiri on unused Wasabi (6 pts)
+    if state.has_unused_wasabi and "Salmon Nigiri" in hand:
+        res.append("Salmon Nigiri")
+
+    # Tempura pair (5 pts) — need exactly 1 already down
+    if occurances(my_table, "Tempura") % 2 == 1 and "Tempura" in hand:
+        res.append("Tempura")
+
+    # Egg Nigiri on unused Wasabi (3 pts)
+    if state.has_unused_wasabi and "Egg Nigiri" in hand:
+        res.append("Egg Nigiri")
+
+    return res
+
+
+def chopstick_combo(hand: list[str], state: GameState) -> Optional[tuple[int, int]]:
+    """
+    If Chopsticks are in our tableau, find the best 2-card play for this turn.
+    Returns (idx1, idx2) where idx1 is played first, or None to skip chopsticks.
+
+    Wasabi MUST be idx1 so the server places it before the Nigiri — otherwise
+    the triple bonus won't apply.
+
+    Priority (same order as valid_combo):
+      1. Two Sashimi   (10 pts) — need exactly 1 in tableau, play 2 to finish triple
+      2. Wasabi + Squid Nigiri  ( 9 pts)
+      3. Wasabi + Salmon Nigiri ( 6 pts)
+      4. Two Tempura   ( 5 pts) — need exactly 1 in tableau, play 2 to finish pair
+      5. Wasabi + Egg Nigiri    ( 3 pts)
+    """
+    if not state.has_chopsticks:
+        return None
+
+    # Sashimi triple (10 pts) — need exactly 1 already down, play 2 from hand to finish
+    if occurances(state.my_tableau, "Sashimi") % 3 == 1:
+        sashimi_indices = [i for i, c in enumerate(hand) if c == "Sashimi"]
+        if len(sashimi_indices) >= 2:
+            return (sashimi_indices[0], sashimi_indices[1])
+
+    # Wasabi + Squid Nigiri (9 pts) — Wasabi must be idx1
+    if "Wasabi" in hand and "Squid Nigiri" in hand:
+        return (hand.index("Wasabi"), hand.index("Squid Nigiri"))
+
+    # Wasabi + Salmon Nigiri (6 pts) — Wasabi must be idx1
+    if "Wasabi" in hand and "Salmon Nigiri" in hand:
+        return (hand.index("Wasabi"), hand.index("Salmon Nigiri"))
+
+    # Tempura pair (5 pts) — need exactly 1 already down, play 2 from hand to finish
+    if occurances(state.my_tableau, "Tempura") % 2 == 1:
+        tempura_indices = [i for i, c in enumerate(hand) if c == "Tempura"]
+        if len(tempura_indices) >= 2:
+            return (tempura_indices[0], tempura_indices[1])
+
+    # Wasabi + Egg Nigiri (3 pts) — Wasabi must be idx1
+    if "Wasabi" in hand and "Egg Nigiri" in hand:
+        return (hand.index("Wasabi"), hand.index("Egg Nigiri"))
+
+    return None
+
+
+def should_grab_chopsticks(hand: list[str], state: GameState) -> bool:
+    """
+    Returns True if we should pick up Chopsticks this turn because the next
+    hand (state.next_hand) contains a combo we can cash in with them.
+
+    Only relevant when:
+      - "Chopsticks" is available in the current hand
+      - We don't already have Chopsticks in our tableau
+      - state.next_hand is known (not None)
+
+    Combos that make grabbing Chopsticks worthwhile:
+      - Next hand has Wasabi + any Nigiri  (play them together for the triple)
+      - Next hand has 2+ Sashimi
+      - Next hand has 2+ Tempura
+    """
+    if "Chopsticks" not in hand:
+        return False
+    if state.has_chopsticks:       # already have chopsticks in tableau
+        return False
+
+    next_h = state.next_hand
+    if next_h is None:             # haven't seen the next hand yet
+        return False
+
+    # Wasabi + Nigiri in next hand → use chopsticks to play them together
+    if "Wasabi" in next_h and any(n in next_h for n in NIGIRI):
+        return True
+
+    # Two or more Sashimi in next hand
+    if next_h.count("Sashimi") >= 2:
+        return True
+
+    # Two or more Tempura in next hand
+    if next_h.count("Tempura") >= 2:
+        return True
+
+    return False
+
+
+def occurances(hand, card):
+    res = 0
+    for i in hand:
+        if i == card:
+            res += 1
+    return res
 
 def choose_chopsticks(hand: list[str], state: GameState) -> Optional[tuple[int, int]]:
     """
@@ -186,10 +321,7 @@ def choose_chopsticks(hand: list[str], state: GameState) -> Optional[tuple[int, 
     Returns:
         (idx1, idx2) tuple to use chopsticks, or None to skip and call choose_card instead.
     """
-    # ──────────────────────────────────────────────────────────────────────────
-    #  INSERT CHOPSTICKS LOGIC HERE  (or leave None to never use them)
-    # ──────────────────────────────────────────────────────────────────────────
-    return None
+    return chopstick_combo(hand, state)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
