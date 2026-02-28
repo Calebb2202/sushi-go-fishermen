@@ -9,6 +9,9 @@ Usage:
 Example:
     python bot_01.py abc123 Bot01
     python bot_01.py abc123 Bot01 192.168.1.50 7878
+
+Run tests:
+    python bot_01.py --test
 """
 
 import json
@@ -30,14 +33,37 @@ class GameState:
     game_id: str
     player_id: int
     rejoin_token: str
+    player_name: str
 
-    # Current hand (updated each turn when HAND is received)
+    # ── Current hand ─────────────────────────────────────────────────────────
+    # Updated each turn when HAND is received
     hand: list[str] = field(default_factory=list)
 
-    # Cards we have played in front of us this round (our tableau)
+    # ── Hand rotation tracking ───────────────────────────────────────────────
+    # Number of players in this game (set from GAME_START)
+    player_count: int = 0
+
+    # All hands we've held this round, indexed by turn order.
+    #   all_hands[0]                  = our starting hand this round
+    #   all_hands[current_hand_ptr]   = hand we are currently holding
+    #   all_hands[current_hand_ptr+1] = next hand we'll receive (None until seen)
+    # Cards are removed from the relevant slot as we play them.
+    # By the end of the round all slots will be populated.
+    all_hands: list = field(default_factory=list)   # list[Optional[list[str]]]
+
+    # Points at the slot in all_hands we are currently holding
+    current_hand_ptr: int = 0
+
+    # ── Tableau tracking ─────────────────────────────────────────────────────
+    # Cards we have played in front of us this round
     my_tableau: list[str] = field(default_factory=list)
 
-    # The most recently played card (updated each turn before we send PLAY)
+    # What every player has played this round: {player_name: [card, ...]}
+    # Updated after each PLAYED message — use this to see opponents' boards
+    all_tableaux: dict[str, list[str]] = field(default_factory=dict)
+
+    # ── Turn-level info ───────────────────────────────────────────────────────
+    # The card we played most recently (set just before PLAY is sent)
     last_card_played: Optional[str] = None
 
     # What every player revealed last turn: {player_name: [card, ...]}
@@ -48,6 +74,14 @@ class GameState:
     turn: int = 1
 
     # ── Convenience helpers ──────────────────────────────────────────────────
+
+    @property
+    def next_hand(self) -> Optional[list[str]]:
+        """The hand we'll receive next turn (None if not yet seen this round)."""
+        idx = self.current_hand_ptr + 1
+        if idx < len(self.all_hands):
+            return self.all_hands[idx]
+        return None
 
     def count(self, card: str) -> int:
         """How many of a card type are in my tableau this round."""
@@ -86,16 +120,49 @@ def choose_card(hand: list[str], state: GameState) -> int:
     Returns:
         0-based index into `hand` of the card to play.
 
-    Useful state attributes:
-        state.my_tableau          — cards you've already played this round
-        state.last_card_played    — card you played last turn (None on first turn)
-        state.last_turn_reveals   — {player_name: [cards]} everyone showed last turn
-        state.has_unused_wasabi   — True if you have a Wasabi without a Nigiri
-        state.has_chopsticks      — True if Chopsticks are in your tableau
-        state.round               — current round number (1, 2, or 3)
-        state.turn                — turn number within the current round
-        state.count("Sashimi")    — how many of a card you have in your tableau
-        state.puddings            — pudding count this round
+    ── Card name strings (exact, case-sensitive) ────────────────────────────
+        "Tempura"           — 5 pts per pair in your tableau
+        "Sashimi"           — 10 pts per set of 3 in your tableau
+        "Dumpling"          — 1/3/6/10/15 pts for 1/2/3/4/5+ dumplings
+        "Maki Roll (1)"     — 1 maki symbol; most maki = 6 pts, 2nd most = 3 pts
+        "Maki Roll (2)"     — 2 maki symbols
+        "Maki Roll (3)"     — 3 maki symbols
+        "Egg Nigiri"        — 1 pt (3 pts if played on a Wasabi)
+        "Salmon Nigiri"     — 2 pts (6 pts if played on a Wasabi)
+        "Squid Nigiri"      — 3 pts (9 pts if played on a Wasabi)
+        "Wasabi"            — triples the value of the next Nigiri you play
+        "Pudding"           — end-of-game: most puddings +6 pts, fewest -6 pts
+        "Chopsticks"        — on a future turn, play two cards instead of one
+
+    ── Current turn ─────────────────────────────────────────────────────────
+        hand                          — list[str] of cards in your hand right now
+        state.hand                    — same list (also passed as first arg)
+        state.last_card_played        — card you played last turn (None on first turn)
+        state.round                   — current round number: 1, 2, or 3
+        state.turn                    — turn number within the current round
+
+    ── Your tableau (cards played in front of you this round) ───────────────
+        state.my_tableau              — list[str] of all cards you've played this round
+        state.count("Sashimi")        — how many of a specific card are in your tableau
+        state.puddings                — int: number of Puddings in your tableau
+        state.has_unused_wasabi       — True if you have a Wasabi not yet paired with Nigiri
+        state.has_chopsticks          — True if Chopsticks are in your tableau (usable)
+
+    ── Hand rotation tracking ───────────────────────────────────────────────
+        state.all_hands               — list of every hand you've held this round;
+                                        slots are None until you've seen that hand.
+                                        Cards are removed as you play them.
+        state.current_hand_ptr        — index of the hand you're currently holding
+        state.next_hand               — all_hands[ptr+1]: the hand coming to you
+                                        next turn (None if not yet seen)
+        state.player_count            — total number of players in this game
+
+    ── Opponent tracking ────────────────────────────────────────────────────
+        state.all_tableaux            — {player_name: list[str]} everyone's full
+                                        board this round, updated each turn
+        state.last_turn_reveals       — {player_name: list[str]} what each player
+                                        revealed last turn only
+        state.player_name             — your own name (to look yourself up in the dicts)
     """
     # ──────────────────────────────────────────────────────────────────────────
     #  INSERT ALGORITHM HERE
@@ -184,6 +251,7 @@ class SushiGoBot:
                 game_id=parts[1],
                 player_id=int(parts[2]),
                 rejoin_token=parts[3] if len(parts) > 3 else "",
+                player_name=player_name,
             )
             print(f"Joined game '{self.state.game_id}' as player {self.state.player_id}")
             print(f"Rejoin token: {self.state.rejoin_token}")
@@ -241,7 +309,22 @@ class SushiGoBot:
         self.state.last_card_played = card
         self.state.my_tableau.append(card)
 
+        # Remove the played card from the copy of this hand we're tracking
+        ptr = self.state.current_hand_ptr
+        if ptr < len(self.state.all_hands) and self.state.all_hands[ptr] is not None:
+            tracked = self.state.all_hands[ptr]
+            if card in tracked:
+                tracked.remove(card)
+
     # ── Server message handlers ──────────────────────────────────────────────
+
+    def handle_game_start(self, message: str):
+        """GAME_START <player_count> — initialise hand-rotation tracking."""
+        parts = message.split()
+        if self.state and len(parts) >= 2:
+            self.state.player_count = int(parts[1])
+            self.state.all_hands = [None] * self.state.player_count
+            print(f"Game starting with {self.state.player_count} players")
 
     def handle_round_start(self, message: str):
         parts = message.split()
@@ -250,14 +333,33 @@ class SushiGoBot:
         self.state.my_tableau = []
         self.state.last_card_played = None
         self.state.last_turn_reveals = {}
+        # Reset hand rotation for this round
+        self.state.current_hand_ptr = 0
+        self.state.all_hands = [None] * max(self.state.player_count, 1)
+        self.state.all_tableaux = {}
         print(f"\n{'─'*40}")
         print(f"  ROUND {self.state.round} STARTING")
         print(f"{'─'*40}")
 
     def handle_played(self, message: str):
-        """Cards were revealed — record what everyone played and advance turn."""
-        self.state.last_turn_reveals = self.parse_played(message)
+        """Cards were revealed — update all tableaux, advance hand pointer."""
+        reveals = self.parse_played(message)
+        self.state.last_turn_reveals = reveals
         self.state.turn += 1
+
+        # Append each player's played card(s) to their tableau
+        for player, cards in reveals.items():
+            if player not in self.state.all_tableaux:
+                self.state.all_tableaux[player] = []
+            self.state.all_tableaux[player].extend(cards)
+
+        # Keep my_tableau in sync with all_tableaux for our own name
+        our_name = self.state.player_name
+        if our_name in self.state.all_tableaux:
+            self.state.my_tableau = list(self.state.all_tableaux[our_name])
+
+        # Advance pointer — next HAND we receive goes into all_hands[ptr]
+        self.state.current_hand_ptr += 1
 
     def handle_round_end(self, message: str):
         # ROUND_END <round> <scores_json>
@@ -300,6 +402,8 @@ class SushiGoBot:
                 if msg.startswith("GAME_END"):
                     self.handle_game_end(msg)
                     break
+                elif msg.startswith("GAME_START"):
+                    self.handle_game_start(msg)
                 elif msg.startswith("ROUND_START"):
                     self.handle_round_start(msg)
                 elif msg.startswith("PLAYED"):
@@ -307,9 +411,14 @@ class SushiGoBot:
                 elif msg.startswith("ROUND_END"):
                     self.handle_round_end(msg)
                 elif msg.startswith("HAND"):
-                    self.state.hand = self.parse_hand(msg)
+                    parsed = self.parse_hand(msg)
+                    self.state.hand = parsed
+                    # Store a copy in our hand-rotation tracker
+                    ptr = self.state.current_hand_ptr
+                    if ptr < len(self.state.all_hands):
+                        self.state.all_hands[ptr] = list(parsed)
                     self.play_turn()
-                # OK, WAITING, JOINED, GAME_START — logged automatically, no action needed
+                # OK, WAITING, JOINED — logged automatically, no action needed
 
         except KeyboardInterrupt:
             print("\nDisconnecting...")
@@ -321,13 +430,119 @@ class SushiGoBot:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  TESTS  —  run with: python bot_01.py --test
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_tests():
+    passed = 0
+    failed = 0
+
+    def check(label: str, actual, expected):
+        nonlocal passed, failed
+        if actual == expected:
+            print(f"  PASS  {label}")
+            passed += 1
+        else:
+            print(f"  FAIL  {label}")
+            print(f"        expected: {expected!r}")
+            print(f"        got:      {actual!r}")
+            failed += 1
+
+    print("\n── Test: hand rotation tracking ─────────────────────────────")
+
+    # Build a bot and a fake state (no real network connection needed)
+    bot = SushiGoBot.__new__(SushiGoBot)
+    bot.state = GameState(
+        game_id="test",
+        player_id=0,
+        rejoin_token="",
+        player_name="Alice",
+        player_count=3,
+        all_hands=[None, None, None],
+        current_hand_ptr=0,
+    )
+
+    # Simulate ROUND_START 1
+    bot.handle_round_start("ROUND_START 1")
+    check("round resets to 1", bot.state.round, 1)
+    check("ptr resets to 0", bot.state.current_hand_ptr, 0)
+    check("all_hands has 3 slots", len(bot.state.all_hands), 3)
+    check("all_hands starts empty", bot.state.all_hands, [None, None, None])
+
+    # Simulate receiving first HAND
+    hand1 = ["Tempura", "Sashimi", "Salmon Nigiri", "Pudding"]
+    hand1_msg = "HAND 0:Tempura 1:Sashimi 2:Salmon Nigiri 3:Pudding"
+    parsed = bot.parse_hand(hand1_msg)
+    bot.state.hand = parsed
+    bot.state.all_hands[bot.state.current_hand_ptr] = list(parsed)
+
+    check("hand parsed correctly", bot.state.hand, hand1)
+    check("all_hands[0] populated", bot.state.all_hands[0], hand1)
+    check("next_hand is None (unseen)", bot.state.next_hand, None)
+
+    # Simulate playing Tempura (index 0)
+    bot._record_play("Tempura")
+    check("last_card_played = Tempura", bot.state.last_card_played, "Tempura")
+    check("my_tableau has Tempura", bot.state.my_tableau, ["Tempura"])
+    check("all_hands[0] has Tempura removed", bot.state.all_hands[0], ["Sashimi", "Salmon Nigiri", "Pudding"])
+
+    # Simulate PLAYED — everyone reveals their card
+    played_msg = "PLAYED Alice:Tempura; Bob:Sashimi; Carol:Dumpling"
+    bot.handle_played(played_msg)
+    check("ptr advances to 1", bot.state.current_hand_ptr, 1)
+    check("all_tableaux[Alice]", bot.state.all_tableaux.get("Alice"), ["Tempura"])
+    check("all_tableaux[Bob]", bot.state.all_tableaux.get("Bob"), ["Sashimi"])
+    check("all_tableaux[Carol]", bot.state.all_tableaux.get("Carol"), ["Dumpling"])
+    check("last_turn_reveals correct", bot.state.last_turn_reveals, {
+        "Alice": ["Tempura"], "Bob": ["Sashimi"], "Carol": ["Dumpling"]
+    })
+
+    # Simulate receiving second HAND (the rotated hand)
+    hand2 = ["Maki Roll (3)", "Dumpling", "Wasabi"]
+    hand2_msg = "HAND 0:Maki Roll (3) 1:Dumpling 2:Wasabi"
+    parsed2 = bot.parse_hand(hand2_msg)
+    bot.state.hand = parsed2
+    bot.state.all_hands[bot.state.current_hand_ptr] = list(parsed2)
+
+    check("all_hands[1] populated", bot.state.all_hands[1], hand2)
+    check("next_hand is None (turn 3 unseen)", bot.state.next_hand, None)
+    check("ptr still 1", bot.state.current_hand_ptr, 1)
+
+    # Simulate playing Wasabi (index 2)
+    bot._record_play("Wasabi")
+    check("last_card_played = Wasabi", bot.state.last_card_played, "Wasabi")
+    check("has_unused_wasabi = True", bot.state.has_unused_wasabi, True)
+    check("all_hands[1] has Wasabi removed", bot.state.all_hands[1], ["Maki Roll (3)", "Dumpling"])
+
+    # Simulate PLAYED turn 2
+    bot.handle_played("PLAYED Alice:Wasabi; Bob:Maki Roll (2); Carol:Sashimi")
+    check("ptr advances to 2", bot.state.current_hand_ptr, 2)
+    check("all_tableaux[Alice] has both cards", bot.state.all_tableaux.get("Alice"), ["Tempura", "Wasabi"])
+
+    print("\n── Test: parse_played with multiple cards (chopsticks) ───────")
+    reveals = bot.parse_played("PLAYED Alice:Squid Nigiri,Tempura; Bob:Sashimi")
+    check("chopsticks play parsed", reveals.get("Alice"), ["Squid Nigiri", "Tempura"])
+    check("single card still works", reveals.get("Bob"), ["Sashimi"])
+
+    print(f"\n{'─'*40}")
+    print(f"  {passed} passed, {failed} failed")
+    print(f"{'─'*40}\n")
+    return failed == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "--test":
+        success = run_tests()
+        sys.exit(0 if success else 1)
+
     if len(sys.argv) < 3:
         print("Usage: python bot_01.py <game_id> <player_name> [host] [port]")
         print("   or: python bot_01.py <host> <port> <game_id> <player_name>")
+        print("   or: python bot_01.py --test")
         sys.exit(1)
 
     args = sys.argv[1:]
