@@ -195,7 +195,7 @@ def choose_card(hand: list[str], state: GameState) -> int:
         count = tableau.count("Pudding")
         pudding_counts.append(count)
     if not pudding_counts:
-        return hand.index("Pudding")
+        pass
     elif (state.puddings < max(pudding_counts) and state.puddings + turns_left > max(pudding_counts)) or (state.puddings <= min(pudding_counts)):
         if "Pudding" in hand:
             return hand.index("Pudding")
@@ -582,7 +582,44 @@ class SushiGoBot:
             pass
         print("Game over!")
 
-    # ── Main game loop ───────────────────────────────────────────────────────
+    # ── Game loop (shared by single-game and tournament) ─────────────────────
+
+    def _play_game(self) -> Optional[str]:
+        """
+        Play one full game.
+        Returns a TOURNAMENT_MATCH or TOURNAMENT_COMPLETE message if one arrives
+        mid-game (so the tournament loop can act on it), otherwise None.
+        """
+        while True:
+            msg = self.recv()
+            if not msg:
+                continue
+
+            # Tournament messages can arrive during a game — bubble them up
+            if msg.startswith("TOURNAMENT_MATCH") or msg.startswith("TOURNAMENT_COMPLETE"):
+                return msg
+
+            if msg.startswith("GAME_END"):
+                self.handle_game_end(msg)
+                return None
+            elif msg.startswith("GAME_START"):
+                self.handle_game_start(msg)
+            elif msg.startswith("ROUND_START"):
+                self.handle_round_start(msg)
+            elif msg.startswith("PLAYED"):
+                self.handle_played(msg)
+            elif msg.startswith("ROUND_END"):
+                self.handle_round_end(msg)
+            elif msg.startswith("HAND"):
+                parsed = self.parse_hand(msg)
+                self.state.hand = parsed
+                ptr = self.state.current_hand_ptr
+                if ptr < len(self.state.all_hands):
+                    self.state.all_hands[ptr] = list(parsed)
+                self.play_turn()
+            # OK, WAITING, JOINED — logged automatically, no action needed
+
+    # ── Single-game entry point ───────────────────────────────────────────────
 
     def run(self, game_id: str, player_name: str):
         try:
@@ -592,32 +629,106 @@ class SushiGoBot:
                 return
 
             self.send("READY")
+            self._play_game()
+
+        except KeyboardInterrupt:
+            print("\nDisconnecting...")
+        except Exception as e:
+            print(f"Error: {e}")
+            raise
+        finally:
+            self.disconnect()
+
+    # ── Tournament entry point ────────────────────────────────────────────────
+
+    def _join_tournament(self, tournament_id: str, player_name: str) -> bool:
+        """Send TOURNEY, wait for TOURNAMENT_WELCOME."""
+        self.send(f"TOURNEY {tournament_id} {player_name}")
+        response = self.recv_until(
+            lambda m: m.startswith("TOURNAMENT_WELCOME") or m.startswith("ERROR")
+        )
+        if response.startswith("TOURNAMENT_WELCOME"):
+            parts = response.split()
+            rejoin_token = parts[3] if len(parts) > 3 else ""
+            print(f"Joined tournament '{tournament_id}' (rejoin token: {rejoin_token})")
+            return True
+        print(f"Failed to join tournament: {response}")
+        return False
+
+    def _join_match(self, match_token: str, player_name: str) -> bool:
+        """Send TJOIN, wait for WELCOME, set up game state for the new match."""
+        self.send(f"TJOIN {match_token}")
+        response = self.recv_until(
+            lambda m: m.startswith("WELCOME") or m.startswith("ERROR")
+        )
+        if response.startswith("WELCOME"):
+            parts = response.split()
+            self.state = GameState(
+                game_id=parts[1],
+                player_id=int(parts[2]),
+                rejoin_token=parts[3] if len(parts) > 3 else "",
+                player_name=player_name,
+            )
+            print(f"Joined match '{self.state.game_id}' as player {self.state.player_id}")
+            return True
+        print(f"Failed to join match: {response}")
+        return False
+
+    def _leave_game(self):
+        """Send LEAVE after a tournament match so we can join the next one."""
+        self.send("LEAVE")
+        self.recv_until(lambda m: m.startswith("OK") or m.startswith("ERROR"))
+        self.state = None
+
+    def run_tournament(self, tournament_id: str, player_name: str):
+        try:
+            self.connect()
+
+            if not self._join_tournament(tournament_id, player_name):
+                return
+
+            pending_message = None
 
             while True:
-                msg = self.recv()
+                msg = pending_message if pending_message else self.recv()
+                pending_message = None
+
                 if not msg:
                     continue
 
-                if msg.startswith("GAME_END"):
-                    self.handle_game_end(msg)
+                if msg.startswith("TOURNAMENT_MATCH"):
+                    # TOURNAMENT_MATCH <tid> <match_token> <round> [<opponent>]
+                    parts = msg.split()
+                    match_token = parts[2]
+                    round_num   = parts[3]
+                    opponent    = parts[4] if len(parts) > 4 else "unknown"
+
+                    if match_token == "BYE" or opponent == "BYE":
+                        print(f"Tournament round {round_num}: BYE — auto-advancing")
+                        continue
+
+                    print(f"Tournament round {round_num}: vs {opponent}")
+
+                    if not self._join_match(match_token, player_name):
+                        continue
+
+                    self.send("READY")
+
+                    # Play the game; may return a tournament message that arrived mid-game
+                    pending_message = self._play_game()
+
+                    self._leave_game()
+
+                elif msg.startswith("TOURNAMENT_COMPLETE"):
+                    parts = msg.split()
+                    winner = parts[2] if len(parts) > 2 else "unknown"
+                    print(f"Tournament complete! Winner: {winner}")
                     break
-                elif msg.startswith("GAME_START"):
-                    self.handle_game_start(msg)
-                elif msg.startswith("ROUND_START"):
-                    self.handle_round_start(msg)
-                elif msg.startswith("PLAYED"):
-                    self.handle_played(msg)
-                elif msg.startswith("ROUND_END"):
-                    self.handle_round_end(msg)
-                elif msg.startswith("HAND"):
-                    parsed = self.parse_hand(msg)
-                    self.state.hand = parsed
-                    # Store a copy in our hand-rotation tracker
-                    ptr = self.state.current_hand_ptr
-                    if ptr < len(self.state.all_hands):
-                        self.state.all_hands[ptr] = list(parsed)
-                    self.play_turn()
-                # OK, WAITING, JOINED — logged automatically, no action needed
+
+                elif msg.startswith("TOURNAMENT_JOINED"):
+                    print(f"  {msg}")
+
+                # Ignore other messages (TOURNAMENT_WELCOME extras, etc.)
 
         except KeyboardInterrupt:
             print("\nDisconnecting...")
@@ -733,32 +844,45 @@ def run_tests():
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _parse_args(args):
+    """Parse [host port] id name or id name [host] [port] into (host, port, id, name)."""
+    host, port = "localhost", 7878
+    if len(args) >= 4 and args[1].isdigit():
+        host, port = args[0], int(args[1])
+        return host, port, args[2], args[3]
+    else:
+        id_, name = args[0], args[1]
+        if len(args) > 2:
+            host = args[2]
+        if len(args) > 3:
+            port = int(args[3])
+        return host, port, id_, name
+
+
 def main():
     if len(sys.argv) >= 2 and sys.argv[1] == "--test":
         success = run_tests()
         sys.exit(0 if success else 1)
 
+    # Tournament mode: python royale_bot.py --tournament <tournament_id> <player_name> [host] [port]
+    if len(sys.argv) >= 2 and sys.argv[1] == "--tournament":
+        args = sys.argv[2:]
+        if len(args) < 2:
+            print("Usage: python royale_bot.py --tournament <tournament_id> <player_name> [host] [port]")
+            sys.exit(1)
+        host, port, tournament_id, player_name = _parse_args(args)
+        SushiGoBot(host, port).run_tournament(tournament_id, player_name)
+        return
+
+    # Single-game mode (existing behaviour)
     if len(sys.argv) < 3:
-        print("Usage: python bot_01.py <game_id> <player_name> [host] [port]")
-        print("   or: python bot_01.py <host> <port> <game_id> <player_name>")
-        print("   or: python bot_01.py --test")
+        print("Usage: python royale_bot.py <game_id> <player_name> [host] [port]")
+        print("   or: python royale_bot.py <host> <port> <game_id> <player_name>")
+        print("   or: python royale_bot.py --tournament <tournament_id> <player_name> [host] [port]")
+        print("   or: python royale_bot.py --test")
         sys.exit(1)
 
-    args = sys.argv[1:]
-    host = "localhost"
-    port = 7878
-
-    # Support both argument orders (match first_card_bot.py convention)
-    if len(args) >= 4 and args[1].isdigit():
-        host, port = args[0], int(args[1])
-        game_id, player_name = args[2], args[3]
-    else:
-        game_id, player_name = args[0], args[1]
-        if len(args) > 2:
-            host = args[2]
-        if len(args) > 3:
-            port = int(args[3])
-
+    host, port, game_id, player_name = _parse_args(sys.argv[1:])
     SushiGoBot(host, port).run(game_id, player_name)
 
 
