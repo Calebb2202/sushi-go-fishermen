@@ -4,32 +4,56 @@ First Card Bot - A simple Sushi Go player that always picks the first card.
 
 Usage:
     python first_card_bot.py <game_id> <player_name> [host] [port]
+    python first_card_bot.py <host> <port> <game_id> <player_name>
 
 Example:
     python first_card_bot.py abc123 FirstBot
     python first_card_bot.py abc123 FirstBot localhost 7878
+    python first_card_bot.py localhost 7878 abc123 FirstBot
 """
 
+import random
 import socket
 import sys
-import random
 import time
 
 
 def main():
     if len(sys.argv) < 3:
         print("Usage: python first_card_bot.py <game_id> <player_name> [host] [port]")
+        print("   or: python first_card_bot.py <host> <port> <game_id> <player_name>")
         sys.exit(1)
 
-    game_id = sys.argv[1]
-    player_name = sys.argv[2]
-    host = sys.argv[3] if len(sys.argv) > 3 else "localhost"
-    port = int(sys.argv[4]) if len(sys.argv) > 4 else 7878
+    args = sys.argv[1:]
+    host = "localhost"
+    port = 7878
+
+    # Support both:
+    # 1) <game_id> <player_name> [host] [port]
+    # 2) <host> <port> <game_id> <player_name>
+    if len(args) >= 4 and args[1].isdigit():
+        host = args[0]
+        port = int(args[1])
+        game_id = args[2]
+        player_name = args[3]
+    else:
+        game_id = args[0]
+        player_name = args[1]
+        if len(args) > 2:
+            host = args[2]
+        if len(args) > 3:
+            try:
+                port = int(args[3])
+            except ValueError:
+                print(f"Invalid port: {args[3]}")
+                print("Usage: python first_card_bot.py <game_id> <player_name> [host] [port]")
+                print("   or: python first_card_bot.py <host> <port> <game_id> <player_name>")
+                sys.exit(1)
 
     print(f"Connecting to {host}:{port}...")
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((host, port))
-    sock_file = sock.makefile('r')
+    sock_file = sock.makefile("r", encoding="utf-8", errors="replace")
     print("Connected!")
 
     def send(cmd):
@@ -37,16 +61,54 @@ def main():
         sock.sendall((cmd + "\n").encode())
 
     def recv():
-        msg = sock_file.readline().strip()
-        if not msg:
+        line = sock_file.readline()
+        if line == "":
             raise ConnectionError("Server closed connection")
+        msg = line.strip()
         print(f"<<< {msg}")
         return msg
+
+    def recv_until(predicate):
+        while True:
+            msg = recv()
+            if not msg:
+                continue
+            if predicate(msg):
+                return msg
+
+    def parse_hand_message(message):
+        # Supports both "HAND A B C" and indexed "HAND 0:A 1:B" with spaces in names.
+        tokens = message.split()[1:]
+        if not tokens:
+            return []
+
+        if not any(":" in token for token in tokens):
+            return tokens
+
+        cards = []
+        current = []
+        for token in tokens:
+            if ":" in token:
+                prefix, name = token.split(":", 1)
+                if prefix.isdigit():
+                    if current:
+                        cards.append(" ".join(current))
+                    current = [name]
+                    continue
+            if current:
+                current.append(token)
+            else:
+                cards.append(token)
+        if current:
+            cards.append(" ".join(current))
+        return cards
 
     try:
         # Join the game
         send(f"JOIN {game_id} {player_name}")
-        response = recv()
+        response = recv_until(
+            lambda line: line.startswith("WELCOME") or line.startswith("ERROR")
+        )
         if not response.startswith("WELCOME"):
             print(f"Failed to join: {response}")
             return
@@ -63,6 +125,9 @@ def main():
                 break
             elif msg.startswith("HAND"):
                 # HAND means it's our turn - wait a bit then play the first card
+                hand = parse_hand_message(msg)
+                if not hand:
+                    continue
                 delay = random.uniform(0.5, 2.5)
                 time.sleep(delay)
                 send("PLAY 0")
